@@ -10,3 +10,7 @@ rust-version.workspace = true
 default = []
 
 [dependencies]
+
+[[bench]]
+name = "runtime"
+harness = false

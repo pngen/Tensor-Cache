@@ -158,7 +158,9 @@ impl TensorCache {
             0,
             config.host_capacity,
         )));
-        let mut accel_cap = 0u64;
+        // The mandatory CPU backend acts as an accelerator device; its
+        // capacity (host_capacity) counts toward the accelerator budget.
+        let mut accel_cap = config.host_capacity;
         for b in extra {
             accel_cap = accel_cap.saturating_add(b.byte_capacity());
             backends.register(b);

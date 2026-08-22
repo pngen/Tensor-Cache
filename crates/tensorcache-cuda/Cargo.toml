@@ -11,3 +11,7 @@ default = []
 
 [dependencies]
 tensorcache = { path = "../tensorcache", version = "1.0.0" }
+
+[[bench]]
+name = "cuda"
+harness = false
