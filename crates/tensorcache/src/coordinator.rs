@@ -437,4 +437,111 @@ mod tests {
         });
         assert!(renew.is_err());
     }
+
+    #[test]
+    fn stale_fence_migration_request_is_rejected() {
+        let mut c = Coordinator::new(10_000_000);
+        c.handle(&Message::Register {
+            node_id: "a".into(),
+            addr: "127.0.0.1:1".into(),
+        })
+        .unwrap();
+        c.handle(&Message::Register {
+            node_id: "b".into(),
+            addr: "127.0.0.1:2".into(),
+        })
+        .unwrap();
+        c.handle(&Message::Create {
+            namespace: "ns".into(),
+            key: "k".into(),
+            generation: 1,
+            byte_len: 8,
+            compat: vec![],
+            node_id: "a".into(),
+        })
+        .unwrap();
+        let oid = Address::new("ns", "k", 1).object_id().to_hex();
+        // First migration bumps the fence to 1.
+        let mig = c
+            .handle(&Message::Migrate {
+                object_id: oid.clone(),
+                new_owner: "b".into(),
+                new_owner_addr: "127.0.0.1:2".into(),
+                fence: 0,
+            })
+            .unwrap();
+        let to_fence = match &mig[0] {
+            Message::Migrate { fence, .. } => *fence,
+            _ => panic!(),
+        };
+        c.handle(&Message::MigrateAck {
+            object_id: oid.clone(),
+            new_owner: "b".into(),
+            fence: to_fence,
+        })
+        .unwrap();
+        // A stale request with the old fence 0 is rejected (fence below current 1).
+        let stale = c.handle(&Message::Migrate {
+            object_id: oid,
+            new_owner: "a".into(),
+            new_owner_addr: "127.0.0.1:1".into(),
+            fence: 0,
+        });
+        assert!(stale.is_err());
+    }
+
+    #[test]
+    fn migration_ack_without_pending_is_rejected() {
+        let mut c = Coordinator::new(10_000_000);
+        let ack = c.handle(&Message::MigrateAck {
+            object_id: "nonexistent".into(),
+            new_owner: "b".into(),
+            fence: 5,
+        });
+        assert!(ack.is_err());
+    }
+
+    #[test]
+    fn conflicting_migration_ack_is_rejected() {
+        let mut c = Coordinator::new(10_000_000);
+        c.handle(&Message::Register {
+            node_id: "a".into(),
+            addr: "127.0.0.1:1".into(),
+        })
+        .unwrap();
+        c.handle(&Message::Register {
+            node_id: "b".into(),
+            addr: "127.0.0.1:2".into(),
+        })
+        .unwrap();
+        c.handle(&Message::Create {
+            namespace: "ns".into(),
+            key: "k".into(),
+            generation: 1,
+            byte_len: 8,
+            compat: vec![],
+            node_id: "a".into(),
+        })
+        .unwrap();
+        let oid = Address::new("ns", "k", 1).object_id().to_hex();
+        let mig = c
+            .handle(&Message::Migrate {
+                object_id: oid.clone(),
+                new_owner: "b".into(),
+                new_owner_addr: "127.0.0.1:2".into(),
+                fence: 0,
+            })
+            .unwrap();
+        let to_fence = match &mig[0] {
+            Message::Migrate { fence, .. } => *fence,
+            _ => panic!(),
+        };
+        // An ack for a different new_owner than the pending migration is rejected.
+        let bad = c.handle(&Message::MigrateAck {
+            object_id: oid,
+            new_owner: "c".into(),
+            fence: to_fence,
+        });
+        assert!(bad.is_err());
+    }
 }

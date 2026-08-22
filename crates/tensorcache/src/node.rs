@@ -90,9 +90,30 @@ impl Node {
                     return Err(Error::Integrity("Store payload CRC mismatch".into()));
                 }
                 let compat_key = CompatKey::decode(compat)?;
-                let oid = self
+                let oid = Address::new(namespace.clone(), key.clone(), *generation).object_id();
+                match self
                     .tc
-                    .register(namespace, key, *generation, compat_key, data)?;
+                    .register(namespace, key, *generation, compat_key.clone(), data)
+                {
+                    Ok(_) => {}
+                    Err(Error::Exists(_)) => {
+                        // Idempotent replica store: the new owner may already hold
+                        // a replica. Verify compatibility and byte-equality.
+                        let stored = self.tc.entry_compat_id(&oid)?;
+                        if stored != compat_key.compat_id() {
+                            return Err(Error::Compatibility(
+                                "store conflicts with an existing incompatible object".into(),
+                            ));
+                        }
+                        let existing = self.tc.restore(&oid, &Tier::Host)?;
+                        if existing != *data {
+                            return Err(Error::Integrity(
+                                "store payload differs from the existing object".into(),
+                            ));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
                 // If this object is not yet owned, the first writer becomes owner.
                 let lk = self.coordinator_roundtrip(&Message::Lookup {
                     namespace: namespace.clone(),
@@ -285,11 +306,18 @@ impl Node {
                 source: self.node_id.clone(),
             },
         )?;
-        let _ = read_frame(&mut stream)?
+        let (t, payload) = read_frame(&mut stream)?
             .ok_or_else(|| Error::Protocol("peer closed connection".into()))?;
-        // Consume the StoreAck; treat any frame as success (errors are encoded
-        // as messages by the peer).
-        Ok(())
+        match Message::decode(t, &payload)? {
+            Message::StoreAck { .. } => Ok(()),
+            Message::Error { message, .. } => Err(Error::Protocol(format!(
+                "store rejected by peer: {message}"
+            ))),
+            other => Err(Error::Protocol(format!(
+                "unexpected store reply {:?}",
+                other.msg_type()
+            ))),
+        }
     }
 
     /// Drive a coordinator-authorized migration of `object_id` to `new_owner`.
