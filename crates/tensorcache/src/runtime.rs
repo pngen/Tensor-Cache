@@ -480,6 +480,21 @@ impl TensorCache {
     }
 
     /// Inspect an object's metadata.
+    /// Return the compatibility identity (digest) of an object, used by the
+    /// owner to gate peer reuse requests.
+    pub fn entry_compat_id(&self, oid: &ObjectId) -> Result<Digest> {
+        let s = self.lock();
+        let e = self.get_meta(&s, oid)?;
+        Ok(e.compat_id)
+    }
+
+    /// Return the full compatibility key of an object (for peer transfer).
+    pub fn entry_compat(&self, oid: &ObjectId) -> Result<CompatKey> {
+        let s = self.lock();
+        let e = self.get_meta(&s, oid)?;
+        Ok(e.compat.clone())
+    }
+
     pub fn metadata(&self, oid: &ObjectId) -> Result<EntryMetadata> {
         let s = self.lock();
         let e = self.get_meta(&s, oid)?;
@@ -982,7 +997,7 @@ pub struct RecoveryReport {
 mod tests {
     use super::*;
     use crate::backend::BackendId;
-    use crate::dtype::{Dtype, Mutability};
+    use crate::dtype::Dtype;
     use crate::geometry::{Layout, Shape};
 
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1082,7 +1097,6 @@ mod tests {
         // Runtime 2: recover from disk and restore.
         {
             let tc = TensorCache::new(cfg(1 << 20, Some(dir.clone()))).unwrap();
-            let compat = f32_compat(vec![64, 64]);
             let oid = crate::ident::Address::new("ns", "persist", 1).object_id();
             let meta = tc.metadata(&oid).unwrap();
             assert!(meta.durable);
