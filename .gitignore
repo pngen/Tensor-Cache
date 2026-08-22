@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.tmp
+*.part
+*.tmpdir
+/scratch
+**/scratch/
+/perf-data
+**/TensorCache.tmp/
+# Cargo.lock is intentionally tracked for this application/workspace (reproducible builds).

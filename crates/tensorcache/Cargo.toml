@@ -1,0 +1,16 @@
+[package]
+name = "tensorcache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tensor Cache: an open-source, vendor-neutral distributed runtime for reusable tensor-shaped computational state."
+rust-version.workspace = true
+
+[features]
+default = []
+cuda = ["dep:tensorcache-cuda"]
+
+[dependencies]
+tensorcache-cuda = { path = "../tensorcache-cuda", version = "1.0.0", optional = true }
+
+[dev-dependencies]

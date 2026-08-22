@@ -1,0 +1,18 @@
+[package]
+name = "tensorcache-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tensor Cache command-line interface and runtime processes."
+rust-version.workspace = true
+
+[[bin]]
+name = "tensorcache"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["tensorcache/cuda"]
+
+[dependencies]
+tensorcache = { workspace = true }

@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tensorcache",
+    "crates/tensorcache-cuda",
+    "crates/tensorcache-cli",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/tensor-cache/tensor-cache"
+rust-version = "1.75"
+
+[workspace.dependencies]
+tensorcache = { path = "crates/tensorcache", version = "1.0.0" }
+tensorcache-cuda = { path = "crates/tensorcache-cuda", version = "1.0.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+panic = "unwind"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+debug = false

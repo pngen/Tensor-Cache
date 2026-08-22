@@ -1,0 +1,10 @@
+[package]
+name = "tensorcache-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional CUDA backend for Tensor Cache (contains isolated unsafe FFI; not compiled into the core)."
+rust-version.workspace = true
+
+[features]
+default = []
