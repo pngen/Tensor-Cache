@@ -5,17 +5,18 @@ version = 3
 [[package]]
 name = "tensorcache"
 version = "1.0.0"
-dependencies = [
- "tensorcache-cuda",
-]
 
 [[package]]
 name = "tensorcache-cli"
 version = "1.0.0"
 dependencies = [
  "tensorcache",
+ "tensorcache-cuda",
 ]
 
 [[package]]
 name = "tensorcache-cuda"
 version = "1.0.0"
+dependencies = [
+ "tensorcache",
+]

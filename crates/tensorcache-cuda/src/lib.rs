@@ -1,8 +1,11 @@
 #![allow(unsafe_code)]
-//! Optional CUDA backend for Tensor Cache.
+//! Optional CUDA backend for Tensor Cache (isolated unsafe FFI).
 //!
-//! This crate is the only place where unsafe FFI is permitted. It loads the
-//! CUDA runtime library dynamically at runtime so that the core does not
-//! carry a link-time CUDA dependency.
+//! The CUDA runtime API is loaded dynamically at runtime so the core never
+//! carries a link-time CUDA dependency. See backend.rs for the backend and
+//! loader.rs for the dynamic loader.
 
-// Placeholder backend; implemented in a later build step.
+mod backend;
+mod loader;
+
+pub use backend::CudaBackend;

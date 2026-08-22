@@ -2,7 +2,7 @@
 //! command. These run as independent OS processes over TCP.
 
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tensorcache::coordinator::Coordinator;
@@ -56,7 +56,15 @@ fn open_store(dir: &str, capacity: u64) -> Result<TensorCache> {
         persistent_path: Some(PathBuf::from(dir)),
         ..Default::default()
     };
-    TensorCache::new(config)
+    #[cfg(feature = "cuda")]
+    {
+        let cuda = tensorcache_cuda::CudaBackend::new(0, capacity.max(1 << 20))?;
+        TensorCache::with_backends(config, vec![Box::new(cuda)])
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        TensorCache::new(config)
+    }
 }
 
 /// Run the coordinator server process.
@@ -64,8 +72,9 @@ pub fn run_coordinator(flags: &std::collections::HashMap<String, String>) -> Res
     let listen = args::req(flags, "listen")?;
     let lease_ns = args::num(flags, "lease-ns", 20_000_000_000)?;
     let mut coord = Coordinator::new(lease_ns);
-    if let Some(snap) = args::opt(flags, "snapshot") {
-        coord.load_state(&PathBuf::from(snap))?;
+    let snap = args::opt(flags, "snapshot").map(PathBuf::from);
+    if let Some(p) = &snap {
+        coord.load_state(p)?;
     }
     let coord = Arc::new(Mutex::new(coord));
     let listener = TcpListener::bind(listen)?;
@@ -76,14 +85,19 @@ pub fn run_coordinator(flags: &std::collections::HashMap<String, String>) -> Res
             Err(_) => continue,
         };
         let coord = Arc::clone(&coord);
+        let snap = snap.clone();
         std::thread::spawn(move || {
-            let _ = serve_coordinator_connection(stream, &coord);
+            let _ = serve_coordinator_connection(stream, &coord, snap.as_deref());
         });
     }
     Ok(())
 }
 
-fn serve_coordinator_connection(mut stream: TcpStream, coord: &Mutex<Coordinator>) -> Result<()> {
+fn serve_coordinator_connection(
+    mut stream: TcpStream,
+    coord: &Mutex<Coordinator>,
+    snap: Option<&Path>,
+) -> Result<()> {
     while let Ok(Some((t, payload))) = read_frame(&mut stream) {
         let msg = match Message::decode(t, &payload) {
             Ok(m) => m,
@@ -100,13 +114,17 @@ fn serve_coordinator_connection(mut stream: TcpStream, coord: &Mutex<Coordinator
         };
         let responses = {
             let mut g = coord.lock().unwrap_or_else(|p| p.into_inner());
-            match g.handle(&msg) {
+            let r = match g.handle(&msg) {
                 Ok(r) => r,
                 Err(e) => vec![Message::Error {
                     code: e.kind().into(),
                     message: e.to_string(),
                 }],
+            };
+            if let Some(p) = snap {
+                let _ = g.save_state(p);
             }
+            r
         };
         for r in &responses {
             write_frame(&mut stream, r)?;

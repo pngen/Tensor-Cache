@@ -139,6 +139,13 @@ pub struct TensorCache {
 impl TensorCache {
     /// Create a runtime, opening a durable persistent tier if configured.
     pub fn new(config: RuntimeConfig) -> Result<Self> {
+        Self::with_backends(config, Vec::new())
+    }
+
+    /// Create a runtime with additional (e.g. accelerator) backends. Each
+    /// extra backend's nominal capacity is added to the accelerator tier
+    /// budget. The mandatory CPU backend is always registered first.
+    pub fn with_backends(config: RuntimeConfig, extra: Vec<Box<dyn Backend>>) -> Result<Self> {
         if config.block_size == 0 {
             return Err(Error::InvalidArgument("block size must be nonzero".into()));
         }
@@ -151,6 +158,12 @@ impl TensorCache {
             0,
             config.host_capacity,
         )));
+        let mut accel_cap = 0u64;
+        for b in extra {
+            accel_cap = accel_cap.saturating_add(b.byte_capacity());
+            backends.register(b);
+        }
+        accounting.set_tier_capacity(TierKind::Accelerator, accel_cap);
 
         let persistent = match &config.persistent_path {
             Some(p) => Some(PersistentStore::open(p)?),
