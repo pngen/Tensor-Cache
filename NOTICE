@@ -1,0 +1,18 @@
+Tensor Cache
+
+Copyright © Summon Software Labs
+
+Tensor Cache is an open-source, vendor-neutral runtime for caching and
+governing reusable tensor-shaped computational state across accelerator-local
+memory, system memory, persistent storage, processes, and execution nodes.
+
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file in this distribution for the full license text.
+
+Tensor Cache does not collect or transmit any telemetry. All telemetry is
+written to local files chosen by the operator and never leaves the machine
+running the software.
+
+Tensor Cache accepts contributions from individuals and organizations on the
+terms of the Apache License 2.0 without requiring a Contributor License
+Agreement (CLA). See CONTRIBUTING.md for contribution guidance.
