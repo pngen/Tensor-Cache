@@ -122,39 +122,6 @@ RTX 5090. Run everything plainly (no timeouts):
 cargo test --workspace
 ```
 
-## Limitations
-
-See `VALIDATION.md` for the complete, honest account. Key points: the CUDA
-backend is real and validated only where a CUDA device was present (this
-machine); the `cuda` feature is optional; the planner cost model is config
-input and is not a claim of portable microbenchmarks; QUIC transport is future
-work (bounded framed TCP is used for 1.0.0).
-
-## Roadmap
-
-- HIP / Level Zero / Metal / Vulkan backends (backend contract already
-  accommodates them).
-- QUIC as an alternative transport.
-- Coordinator durable snapshot already implemented; richer reconciliation.
-- Namespace/tenant quota enforcement at the coordinator.
-- Content-addressed structural reuse across namespaces under explicit opt-in.
-
-## Relation to the fabric stack
-
-- **FlashTier** manages where bytes reside.
-- **Context Fabric** manages arbitrary reusable computational state.
-- **Compute Fabric** manages where computation runs.
-- **Reclaim Fabric** manages whether state remains worth retaining.
-- **Checkpoint Fabric** manages what execution state survives.
-- **KV Fabric** manages reusable KV / prefix inference state.
-- **Tensor Cache** manages specialized reusable tensor-cache state.
-
-`Tensor Cache` may be conceptually governed by `Context Fabric` as reusable
-computational state, but it owns the specialized mechanics and economics of
-caching tensor-shaped artifacts. It is narrower than `KV Fabric` (which
-specializes in KV/prefix reusable state) and must not be reduced to a rename of
-it.
-
 ## License
 
-Apache-2.0. See `LICENSE`.
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
