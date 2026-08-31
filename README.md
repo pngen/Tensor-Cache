@@ -116,7 +116,7 @@ tc.verify(&oid)?;                                // integrity across placements
 
 All 96 tests across the workspace pass, including a real multi-process
 coordinator/node integration test and real CUDA validation on an NVIDIA GeForce
-RTX 5090. Run everything plainly (no timeouts):
+RTX 5090. Run the full workspace suite:
 
 ```
 cargo test --workspace
