@@ -32,7 +32,7 @@ service dependency.
 
 ## Validation before submit
 
-Run all validations plainly (never add timeouts):
+Run all validations plainly:
 
 ```
 cargo fmt --check
