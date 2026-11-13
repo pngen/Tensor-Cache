@@ -345,16 +345,19 @@ impl Node {
             Message::Migrate {
                 object_id,
                 new_owner,
+                new_owner_addr,
                 fence,
-                ..
             } => {
-                // Read the local object and push it to the new owner.
+                // Read the local object and push it to the new owner, at the
+                // address the coordinator names for it. The address passed in
+                // by the requester is only what the coordinator falls back to
+                // for a node it does not know.
                 let oid = ObjectId::from_hex(&object_id)?;
                 let meta = self.tc.metadata(&oid)?;
                 let compat = self.tc.entry_compat(&oid)?;
                 let data = self.tc.restore(&oid, &Tier::Host)?;
                 self.store_to(
-                    new_owner_addr,
+                    &new_owner_addr,
                     &meta.namespace,
                     &meta.key,
                     meta.generation,
@@ -370,7 +373,25 @@ impl Node {
                         fence,
                     },
                 )?;
-                Ok(())
+                // Ownership has moved only once the coordinator has taken the
+                // acknowledgement. It answers one it rejects with an error and
+                // otherwise just finishes the connection, so wait for that
+                // before reporting the migration as done.
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .map_err(|e| Error::Io(e.to_string()))?;
+                match read_frame(&mut stream)? {
+                    None => Ok(()),
+                    Some((t, payload)) => match Message::decode(t, &payload)? {
+                        Message::Error { message, .. } => Err(Error::Migration(format!(
+                            "coordinator rejected the migration: {message}"
+                        ))),
+                        other => Err(Error::Protocol(format!(
+                            "unexpected migrate-ack reply {:?}",
+                            other.msg_type()
+                        ))),
+                    },
+                }
             }
             Message::Error { message, .. } => Err(Error::Protocol(message)),
             other => Err(Error::Protocol(format!(
@@ -391,3 +412,173 @@ pub fn parse_node_ref(s: &str) -> Result<(String, String)> {
 
 // Re-export MsgType for convenience (used by the CLI).
 pub use crate::protocol::MsgType;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dtype::Dtype;
+    use crate::geometry::{Layout, Shape};
+    use crate::runtime::RuntimeConfig;
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
+    fn listener() -> (TcpListener, String) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        (l, addr)
+    }
+
+    /// A node that holds one object and talks to `coordinator_addr`.
+    fn node_with_object(coordinator_addr: String) -> (Node, String) {
+        let tc = TensorCache::new(RuntimeConfig {
+            host_capacity: 1 << 20,
+            ..Default::default()
+        })
+        .unwrap();
+        let compat = CompatKey {
+            dtype: Dtype::F32,
+            shape: Shape::new(vec![16, 16]).unwrap(),
+            layout: Layout::RowMajor,
+            model: Some("node-test".into()),
+            ..Default::default()
+        };
+        let data: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let oid = tc.register("ns", "k", 1, compat, &data).unwrap();
+        let node = Node::new(
+            "n1".into(),
+            "127.0.0.1:1".into(),
+            coordinator_addr,
+            tc,
+            1_000_000_000,
+        );
+        (node, oid.to_hex())
+    }
+
+    /// A peer that acknowledges every Store it is sent and reports how many
+    /// it received. It stops at the first connection that sends nothing.
+    fn spawn_peer(listener: TcpListener) -> JoinHandle<usize> {
+        std::thread::spawn(move || {
+            let mut stores = 0;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let Ok(Some((t, payload))) = read_frame(&mut stream) else {
+                    break;
+                };
+                if let Ok(Message::Store {
+                    namespace,
+                    key,
+                    generation,
+                    ..
+                }) = Message::decode(t, &payload)
+                {
+                    stores += 1;
+                    let object_id = Address::new(namespace, key, generation)
+                        .object_id()
+                        .to_hex();
+                    let _ = write_frame(&mut stream, &Message::StoreAck { object_id });
+                }
+            }
+            stores
+        })
+    }
+
+    fn stop_peer(addr: &str, peer: JoinHandle<usize>) -> usize {
+        // A connection that sends nothing ends the peer's accept loop.
+        drop(TcpStream::connect(addr));
+        peer.join().unwrap()
+    }
+
+    /// A coordinator that answers one Migrate request with an instruction for
+    /// `target_addr`, then takes the node's acknowledgement and either accepts
+    /// it (finishes the connection) or rejects it with an error. Reports
+    /// whether an acknowledgement arrived.
+    fn spawn_coordinator(
+        listener: TcpListener,
+        target_addr: String,
+        reject_ack: bool,
+    ) -> JoinHandle<bool> {
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return false;
+            };
+            let Ok(Some((t, payload))) = read_frame(&mut stream) else {
+                return false;
+            };
+            let Ok(Message::Migrate {
+                object_id,
+                new_owner,
+                fence,
+                ..
+            }) = Message::decode(t, &payload)
+            else {
+                return false;
+            };
+            let _ = write_frame(
+                &mut stream,
+                &Message::Migrate {
+                    object_id,
+                    new_owner,
+                    new_owner_addr: target_addr,
+                    fence: fence + 1,
+                },
+            );
+            let acked = matches!(read_frame(&mut stream), Ok(Some((MsgType::MigrateAck, _))));
+            if acked && reject_ack {
+                let _ = write_frame(
+                    &mut stream,
+                    &Message::Error {
+                        code: "authority".into(),
+                        message: "migration ack mismatch".into(),
+                    },
+                );
+            }
+            acked
+        })
+    }
+
+    #[test]
+    fn migration_pushes_the_object_to_the_address_the_coordinator_names() {
+        let (coord_listener, coord_addr) = listener();
+        // Where the coordinator says the new owner is, and what the requester
+        // claimed instead.
+        let (owner_listener, owner_addr) = listener();
+        let (other_listener, other_addr) = listener();
+        let coordinator = spawn_coordinator(coord_listener, owner_addr.clone(), false);
+        let owner = spawn_peer(owner_listener);
+        let other = spawn_peer(other_listener);
+        let (node, oid) = node_with_object(coord_addr);
+
+        let result = node.migrate(&oid, "n2", &other_addr, 0);
+        let acked = coordinator.join().unwrap();
+        let at_owner = stop_peer(&owner_addr, owner);
+        let at_other = stop_peer(&other_addr, other);
+
+        result.unwrap();
+        assert!(acked);
+        assert_eq!(
+            (at_owner, at_other),
+            (1, 0),
+            "the object must reach the coordinator's target, and only it"
+        );
+    }
+
+    #[test]
+    fn migration_fails_when_the_coordinator_rejects_the_acknowledgement() {
+        let (coord_listener, coord_addr) = listener();
+        let (owner_listener, owner_addr) = listener();
+        let coordinator = spawn_coordinator(coord_listener, owner_addr.clone(), true);
+        let owner = spawn_peer(owner_listener);
+        let (node, oid) = node_with_object(coord_addr);
+
+        let result = node.migrate(&oid, "n2", &owner_addr, 0);
+        let acked = coordinator.join().unwrap();
+        let stored = stop_peer(&owner_addr, owner);
+
+        assert!(acked, "the acknowledgement reaches the coordinator");
+        assert_eq!(stored, 1);
+        assert!(
+            matches!(result, Err(Error::Migration(_))),
+            "ownership did not move, so the migration must not succeed: {result:?}"
+        );
+    }
+}

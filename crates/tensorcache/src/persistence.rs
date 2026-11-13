@@ -222,7 +222,7 @@ impl PersistentStore {
 /// rename it into place. On platforms where rename replaces atomically this is
 /// a real atomic commit; elsewhere the leftover temp detection in `recover`
 /// covers interruption.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| Error::Persistence("manifest path has no parent".into()))?;
@@ -236,9 +236,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    if path.exists() {
-        let _ = fs::remove_file(path);
-    }
+    // The rename replaces an existing file in one step. Removing the old file
+    // first would leave a window in which neither version exists.
     fs::rename(&tmp, path)?;
     Ok(())
 }

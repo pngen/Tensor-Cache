@@ -12,7 +12,7 @@
 //! eliminates read->write self-deadlocks and lock-ordering hazards. Mutex
 //! poisoning is recovered rather than propagated as a panic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -21,6 +21,7 @@ use crate::admission::{evaluate_ignoring_capacity, AdmissionCandidate, Admission
 use crate::backend::{Backend, BackendId, BackendRegistry, DeviceBuffer};
 use crate::compat::CompatKey;
 use crate::cost::CostModel;
+use crate::crc::crc32c;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::eviction::{eviction_order, Evictable, EvictionPolicy};
@@ -120,12 +121,66 @@ struct State {
     object_count: u64,
 }
 
+impl State {
+    /// Record the number of cached objects, also where admission reads it.
+    fn set_object_count(&mut self, n: u64) {
+        self.object_count = n;
+        self.accounting.set_object_count(n);
+    }
+
+    /// An entry whose last placement was evicted is no longer cached: it is
+    /// removed, so that it is neither reported as a hit nor in the way of a
+    /// later registration of the same object.
+    fn drop_if_absent(&mut self, key: &str) {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|e| e.placements.is_empty())
+        {
+            self.entries.remove(key);
+            let objects = self.object_count.saturating_sub(1);
+            self.set_object_count(objects);
+        }
+    }
+}
+
 fn now_ns() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// Bytes of `blocks` that a content-addressed tier does not hold yet. A block
+/// that occurs more than once in the list is stored, and so charged, once.
+fn unique_new_bytes(blocks: &[BlockRef], present: impl Fn(&Digest) -> bool) -> u64 {
+    let mut seen: HashSet<Digest> = HashSet::new();
+    let mut total = 0u64;
+    for b in blocks {
+        if !present(&b.content_hash) && seen.insert(b.content_hash) {
+            total += b.len;
+        }
+    }
+    total
+}
+
+/// Check a payload against the block list recorded for its object.
+fn verify_against_blocks(bytes: &[u8], blocks: &[BlockRef]) -> Result<()> {
+    for b in blocks {
+        let start = b.offset as usize;
+        let block = start
+            .checked_add(b.len as usize)
+            .and_then(|end| bytes.get(start..end))
+            .ok_or_else(|| Error::Integrity("payload does not cover its block list".into()))?;
+        if crc32c(block) != b.crc {
+            return Err(Error::Integrity(format!(
+                "block {} checksum mismatch",
+                b.content_hash
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The public runtime.
@@ -259,21 +314,22 @@ impl TensorCache {
         if !decision.is_admit() {
             return Err(Error::AdmissionRejected(decision.reason()));
         }
-        let mut new_host = 0u64;
-        for b in &blocks {
-            if !s.host.contains(&b.content_hash) {
-                new_host += b.len;
+        // Charge the bytes the host arena does not hold yet. Eviction runs
+        // under the same lock and may release blocks this payload shares with
+        // an evicted entry, so the figure is taken again after every round.
+        let mut new_host = unique_new_bytes(&blocks, |h| s.host.contains(h));
+        while new_host > s.accounting.free(TierKind::Host) {
+            let free_before = s.accounting.free(TierKind::Host);
+            self.evict_to_free(&mut s, new_host)?;
+            new_host = unique_new_bytes(&blocks, |h| s.host.contains(h));
+            if s.accounting.free(TierKind::Host) == free_before {
+                break;
             }
         }
         if new_host > s.accounting.free(TierKind::Host) {
-            drop(s);
-            self.evict_to_free(new_host)?;
-            s = self.lock();
-            if new_host > s.accounting.free(TierKind::Host) {
-                return Err(Error::AdmissionRejected(
-                    "no capacity after eviction".into(),
-                ));
-            }
+            return Err(Error::AdmissionRejected(
+                "no capacity after eviction".into(),
+            ));
         }
         s.accounting.reserve(TierKind::Host, new_host)?;
         let mut acquired = Vec::with_capacity(blocks.len());
@@ -301,7 +357,8 @@ impl TensorCache {
             flags: MoveFlags::default(),
         };
         s.entries.insert(oid.to_hex(), entry);
-        s.object_count += 1;
+        let objects = s.object_count + 1;
+        s.set_object_count(objects);
         drop(s);
         self.enforce_capacity()?;
         Ok(oid)
@@ -438,6 +495,7 @@ impl TensorCache {
             }
             self.remove_placement(&mut s, oid, &t)?;
         }
+        s.drop_if_absent(&oid.to_hex());
         drop(s);
         Ok(())
     }
@@ -450,7 +508,8 @@ impl TensorCache {
             self.remove_placement(&mut s, oid, &t)?;
         }
         if s.entries.remove(&oid.to_hex()).is_some() {
-            s.object_count = s.object_count.saturating_sub(1);
+            let objects = s.object_count.saturating_sub(1);
+            s.set_object_count(objects);
         }
         if let Some(st) = &self.persistent {
             st.remove_manifest(&oid.to_hex()).ok();
@@ -576,11 +635,27 @@ impl TensorCache {
                     continue;
                 }
             };
+            // Already loaded: recovering again must not take a second set of
+            // block references or replace a live entry.
+            if s.entries.contains_key(&oid.to_hex()) {
+                continue;
+            }
             if !blocks_exist(store, &meta.blocks) {
                 skipped += 1;
                 continue;
             }
             let blocks = meta.blocks.clone();
+            // The recovered blocks occupy the persistent tier: charge the ones
+            // not accounted for yet. An object the configured budget cannot
+            // hold is left on disk and not loaded.
+            let new_storage = unique_new_bytes(&blocks, |h| s.persistent_refs.contains_key(h));
+            if s.accounting
+                .add_bytes(TierKind::Persistent, new_storage)
+                .is_err()
+            {
+                skipped += 1;
+                continue;
+            }
             for b in &blocks {
                 if let Some(r) = s.persistent_refs.get_mut(&b.content_hash) {
                     *r += 1;
@@ -607,7 +682,8 @@ impl TensorCache {
                 flags: MoveFlags::default(),
             };
             s.entries.insert(oid.to_hex(), entry);
-            s.object_count += 1;
+            let objects = s.object_count + 1;
+            s.set_object_count(objects);
             recovered += 1;
         }
         drop(s);
@@ -630,6 +706,8 @@ impl TensorCache {
                 let be = self.backend(&device.backend)?;
                 let mut buf = vec![0u8; byte_len as usize];
                 be.device_to_host(device, &mut buf)?;
+                // Device bytes are checked like every other tier's.
+                verify_against_blocks(&buf, blocks)?;
                 return Ok(buf);
             }
         }
@@ -664,6 +742,7 @@ impl TensorCache {
                     let be = self.backend(id)?;
                     let mut buf = vec![0u8; byte_len as usize];
                     be.device_to_host(device, &mut buf)?;
+                    verify_against_blocks(&buf, &e.blocks)?;
                     Ok(buf)
                 } else {
                     Err(Error::Internal("placement tier mismatch".into()))
@@ -680,28 +759,28 @@ impl TensorCache {
         tier: &Tier,
         bytes: &[u8],
     ) -> Result<()> {
-        let (byte_len, address, compat, created) = {
+        let (byte_len, address, compat, created, blocks) = {
             let e = self.get_meta(s, oid)?;
             (
                 e.byte_len,
                 e.address.clone(),
                 e.compat.clone(),
                 e.created_ns,
+                e.blocks.clone(),
             )
         };
         if bytes.len() as u64 != byte_len {
             return Err(Error::Integrity("placement payload length mismatch".into()));
         }
+        // A placement is cut along the object's own block list. That is the
+        // list every read and removal of the object goes by, whatever block
+        // size this runtime is configured with, and it lets the payload be
+        // checked before it is installed anywhere.
+        validate_block_list(&blocks, byte_len)?;
+        verify_against_blocks(bytes, &blocks)?;
         match tier {
             Tier::Host => {
-                let blocks = chunk(bytes, self.config.block_size)?;
-                validate_block_list(&blocks, byte_len)?;
-                let mut new_host = 0u64;
-                for b in &blocks {
-                    if !s.host.contains(&b.content_hash) {
-                        new_host += b.len;
-                    }
-                }
+                let new_host = unique_new_bytes(&blocks, |h| s.host.contains(h));
                 if new_host > s.accounting.free(TierKind::Host) {
                     return Err(Error::AdmissionRejected(
                         "host tier capacity exceeded".into(),
@@ -725,7 +804,11 @@ impl TensorCache {
             Tier::Accelerator(backend_id) => {
                 let be = self.backend(backend_id)?;
                 let mut dev = be.allocate(bytes.len())?;
-                be.to_device(bytes, &mut dev)?;
+                if let Err(e) = be.to_device(bytes, &mut dev) {
+                    // Nothing refers to the allocation: hand it back.
+                    let _ = be.free(dev);
+                    return Err(e);
+                }
                 s.accel_used += bytes.len() as u64;
                 if let Some(e) = s.entries.get_mut(&oid.to_hex()) {
                     e.placements.push(Placement::Accelerator { device: dev });
@@ -737,27 +820,29 @@ impl TensorCache {
                     .persistent
                     .as_ref()
                     .ok_or_else(|| Error::Persistence("no persistent tier configured".into()))?;
-                let blocks = chunk(bytes, self.config.block_size)?;
-                validate_block_list(&blocks, byte_len)?;
-                let mut new_storage = 0u64;
-                for b in &blocks {
-                    if !s.persistent_refs.contains_key(&b.content_hash) {
-                        new_storage += b.len;
-                    }
-                }
+                let numel = compat.shape.numel()?;
+                let new_storage = unique_new_bytes(&blocks, |h| s.persistent_refs.contains_key(h));
                 if new_storage > s.accounting.free(TierKind::Persistent) {
                     return Err(Error::AdmissionRejected(
                         "persistent tier capacity exceeded".into(),
                     ));
                 }
                 s.accounting.reserve(TierKind::Persistent, new_storage)?;
+                // Reference (and write, when new) every block, then commit the
+                // manifest. If a step fails, the references taken here are
+                // dropped again and the reservation is cancelled.
+                let mut taken: Vec<&BlockRef> = Vec::with_capacity(blocks.len());
+                let mut failure = None;
                 for b in &blocks {
                     use std::collections::hash_map::Entry;
                     match s.persistent_refs.entry(b.content_hash) {
                         Entry::Vacant(v) => {
                             let start = b.offset as usize;
                             let end = start + b.len as usize;
-                            store.put_block(&bytes[start..end])?;
+                            if let Err(e) = store.put_block(&bytes[start..end]) {
+                                failure = Some(e);
+                                break;
+                            }
                             v.insert(1);
                             s.storage_used += b.len;
                         }
@@ -765,22 +850,39 @@ impl TensorCache {
                             *o.get_mut() += 1;
                         }
                     }
+                    taken.push(b);
+                }
+                if failure.is_none() {
+                    let meta = crate::persistence::PersistEntryMeta {
+                        object_id: oid.to_hex(),
+                        namespace: address.namespace,
+                        key: address.key,
+                        generation: address.generation,
+                        compat,
+                        byte_len,
+                        numel,
+                        created_ns: created,
+                        blocks: blocks.clone(),
+                    };
+                    failure = store.write_manifest(&meta).err();
+                }
+                if let Some(e) = failure {
+                    for b in taken {
+                        if let Some(r) = s.persistent_refs.get_mut(&b.content_hash) {
+                            *r -= 1;
+                            if *r == 0 {
+                                let _ = store.remove_block(&b.content_hash);
+                                s.persistent_refs.remove(&b.content_hash);
+                                s.storage_used = s.storage_used.saturating_sub(b.len);
+                            }
+                        }
+                    }
+                    s.accounting
+                        .cancel_reserve(TierKind::Persistent, new_storage)?;
+                    return Err(e);
                 }
                 s.accounting
                     .commit_reserve(TierKind::Persistent, new_storage)?;
-                let numel = compat.shape.numel()?;
-                let meta = crate::persistence::PersistEntryMeta {
-                    object_id: oid.to_hex(),
-                    namespace: address.namespace,
-                    key: address.key,
-                    generation: address.generation,
-                    compat,
-                    byte_len,
-                    numel,
-                    created_ns: created,
-                    blocks: blocks.clone(),
-                };
-                store.write_manifest(&meta)?;
                 if let Some(e) = s.entries.get_mut(&oid.to_hex()) {
                     e.placements.push(Placement::Persistent);
                 }
@@ -820,6 +922,8 @@ impl TensorCache {
                                     }
                                     s.persistent_refs.remove(&b.content_hash);
                                     s.storage_used = s.storage_used.saturating_sub(b.len);
+                                    // The freed bytes go back to the tier budget.
+                                    s.accounting.sub_bytes(TierKind::Persistent, b.len)?;
                                 }
                             }
                         }
@@ -837,9 +941,8 @@ impl TensorCache {
     }
 
     /// Evict the lowest-scoring non-durable host entries until at least
-    /// `needed` bytes of host capacity are free.
-    fn evict_to_free(&self, needed: u64) -> Result<()> {
-        let mut s = self.lock();
+    /// `needed` bytes of host capacity are free. Runs under the caller's lock.
+    fn evict_to_free(&self, s: &mut State, needed: u64) -> Result<()> {
         if s.accounting.free(TierKind::Host) >= needed {
             return Ok(());
         }
@@ -874,10 +977,10 @@ impl TensorCache {
                 if t == Tier::Persistent {
                     continue;
                 }
-                let _ = self.remove_placement(&mut s, &oid, &t);
+                let _ = self.remove_placement(s, &oid, &t);
             }
+            s.drop_if_absent(&e.object_id);
         }
-        drop(s);
         Ok(())
     }
 
@@ -917,6 +1020,7 @@ impl TensorCache {
                 }
                 let _ = self.remove_placement(&mut s, &oid, &t);
             }
+            s.drop_if_absent(&e.object_id);
         }
         drop(s);
         Ok(())
@@ -1210,5 +1314,382 @@ mod tests {
             .register("ns", "v2", 1, f32_compat(vec![16, 16]), &data)
             .unwrap();
         tc.verify(&oid2).unwrap();
+    }
+
+    /// A 1024-byte block whose content depends on `seed`.
+    fn block(seed: u8) -> Vec<u8> {
+        (0..1024usize)
+            .map(|i| (i as u8).wrapping_mul(3).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn persistent_tier_bytes_are_returned_on_delete() {
+        let dir = temp_dir();
+        let mut config = cfg(1 << 20, Some(dir.clone()));
+        config.persistent_capacity = 4096;
+        let tc = TensorCache::new(config).unwrap();
+        let compat = f32_compat(vec![32, 32]); // 4096 bytes: the whole tier
+        for round in 0..3u8 {
+            let data = [block(round), block(50), block(100), block(150)].concat();
+            let oid = tc
+                .register("ns", "p", round as u64, compat.clone(), &data)
+                .unwrap();
+            tc.persist(&oid).unwrap();
+            assert_eq!(tc.resources().storage_used, 4096);
+            tc.delete(&oid).unwrap();
+            assert_eq!(tc.resources().storage_used, 0);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_objects_count_against_the_persistent_budget() {
+        let dir = temp_dir();
+        let mut config = cfg(1 << 20, Some(dir.clone()));
+        config.persistent_capacity = 8192;
+        let compat = f32_compat(vec![32, 32]); // 4096 bytes
+        let tensor = |seed: u8| {
+            [
+                block(seed),
+                block(seed + 1),
+                block(seed + 2),
+                block(seed + 3),
+            ]
+            .concat()
+        };
+        {
+            let tc = TensorCache::new(config.clone()).unwrap();
+            for (key, seed) in [("a", 10u8), ("b", 20u8)] {
+                let oid = tc
+                    .register("ns", key, 1, compat.clone(), &tensor(seed))
+                    .unwrap();
+                tc.persist(&oid).unwrap();
+            }
+        }
+        // After a restart the tier is as full as it was: nothing more fits.
+        let tc = TensorCache::new(config).unwrap();
+        assert_eq!(tc.resources().storage_used, 8192);
+        let extra = tc
+            .register("ns", "c", 1, compat.clone(), &tensor(30))
+            .unwrap();
+        assert!(matches!(
+            tc.persist(&extra),
+            Err(Error::AdmissionRejected(_))
+        ));
+        assert_eq!(tc.resources().storage_used, 8192);
+        // Deleting a recovered object gives its bytes back.
+        tc.delete(&Address::new("ns", "a", 1).object_id()).unwrap();
+        assert_eq!(tc.resources().storage_used, 4096);
+        tc.persist(&extra).unwrap();
+        assert_eq!(tc.resources().storage_used, 8192);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repeated_blocks_in_one_tensor_are_charged_once() {
+        let dir = temp_dir();
+        let tc = TensorCache::new(cfg(1 << 20, Some(dir.clone()))).unwrap();
+        let compat = f32_compat(vec![32, 32]); // 4096 bytes = 4 blocks
+        let data = vec![0u8; 4096]; // four identical blocks
+        let oid = tc.register("ns", "zeros", 1, compat, &data).unwrap();
+        tc.persist(&oid).unwrap();
+        let r = tc.resources();
+        assert_eq!(r.host_used, 1024, "one physical block is held");
+        assert_eq!(r.storage_used, 1024);
+        assert_eq!(tc.restore(&oid, &Tier::Host).unwrap(), data);
+        tc.verify(&oid).unwrap();
+        tc.delete(&oid).unwrap();
+        let r = tc.resources();
+        assert_eq!((r.host_used, r.storage_used, r.block_count), (0, 0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eviction_that_frees_shared_blocks_keeps_the_host_charge_exact() {
+        // Room for two blocks. A = [x, y]; B = [x, z] shares x with A.
+        let tc = TensorCache::new(cfg(2048, None)).unwrap();
+        let compat = f32_compat(vec![16, 32]); // 2048 bytes = 2 blocks
+        let a = tc
+            .register("ns", "a", 1, compat.clone(), &[block(1), block(2)].concat())
+            .unwrap();
+        // Admitting B evicts A, and with it the block the two share.
+        let b = tc
+            .register("ns", "b", 1, compat.clone(), &[block(1), block(3)].concat())
+            .unwrap();
+        let r = tc.resources();
+        assert_eq!(r.block_count, 2);
+        assert_eq!(r.host_used, 2048, "both of B's blocks are charged");
+        assert!(matches!(tc.metadata(&a), Err(Error::NotFound(_))));
+        tc.delete(&b).unwrap();
+        assert_eq!(tc.resources().host_used, 0);
+    }
+
+    #[test]
+    fn evicted_entry_is_not_a_hit_and_can_be_registered_again() {
+        let tc = TensorCache::new(cfg(4096, None)).unwrap();
+        let compat = f32_compat(vec![32, 32]); // 4096 bytes: the whole tier
+        let first = payload(4096);
+        let second: Vec<u8> = first.iter().map(|b| b ^ 0x5a).collect();
+        let a = tc.register("ns", "a", 1, compat.clone(), &first).unwrap();
+        // Admitting "b" evicts "a", which then holds no bytes anywhere: it is
+        // a miss, not a hit without data.
+        tc.register("ns", "b", 1, compat.clone(), &second).unwrap();
+        assert!(matches!(
+            tc.lookup("ns", "a", 1, &compat),
+            Err(Error::NotFound(_))
+        ));
+        assert_eq!(tc.resources().object_count, 1);
+        // Once recomputed it can be cached again.
+        let again = tc.register("ns", "a", 1, compat.clone(), &first).unwrap();
+        assert_eq!(again, a);
+        assert_eq!(tc.restore(&again, &Tier::Host).unwrap(), first);
+        // Explicitly evicting a non-durable object drops it the same way.
+        tc.evict(&again).unwrap();
+        assert!(matches!(tc.metadata(&again), Err(Error::NotFound(_))));
+        let r = tc.resources();
+        assert_eq!((r.object_count, r.host_used), (0, 0));
+    }
+
+    #[test]
+    fn object_count_limit_is_enforced() {
+        let mut config = cfg(1 << 20, None);
+        config.admission.max_objects = Some(2);
+        let tc = TensorCache::new(config).unwrap();
+        let compat = f32_compat(vec![16, 16]); // 1024 bytes
+        let a = tc
+            .register("ns", "a", 1, compat.clone(), &block(1))
+            .unwrap();
+        tc.register("ns", "b", 1, compat.clone(), &block(2))
+            .unwrap();
+        assert!(matches!(
+            tc.register("ns", "c", 1, compat.clone(), &block(3)),
+            Err(Error::AdmissionRejected(_))
+        ));
+        assert_eq!(tc.resources().object_count, 2);
+        // Removing an object makes room under the limit again.
+        tc.delete(&a).unwrap();
+        tc.register("ns", "c", 1, compat, &block(3)).unwrap();
+    }
+
+    #[test]
+    fn recover_is_idempotent() {
+        let dir = temp_dir();
+        let config = cfg(1 << 20, Some(dir.clone()));
+        let compat = f32_compat(vec![32, 32]);
+        let oid;
+        {
+            let tc = TensorCache::new(config.clone()).unwrap();
+            oid = tc.register("ns", "p", 1, compat, &payload(4096)).unwrap();
+            tc.persist(&oid).unwrap();
+        }
+        let tc = TensorCache::new(config).unwrap();
+        tc.restore(&oid, &Tier::Host).unwrap();
+        // Recovering again on the live runtime changes nothing.
+        assert_eq!(tc.recover().unwrap().recovered, 0);
+        let r = tc.resources();
+        assert_eq!(
+            (r.object_count, r.storage_used, r.host_used),
+            (1, 4096, 4096)
+        );
+        assert!(tc.metadata(&oid).unwrap().placements.contains(&Tier::Host));
+        tc.delete(&oid).unwrap();
+        let r = tc.resources();
+        assert_eq!((r.object_count, r.storage_used, r.host_used), (0, 0, 0));
+        assert_eq!(
+            std::fs::read_dir(dir.join("blocks")).unwrap().count(),
+            0,
+            "block files of the deleted object remain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_placement_follows_the_object_block_list() {
+        let dir = temp_dir();
+        let compat = f32_compat(vec![32, 32]);
+        let oid;
+        {
+            // Stored in 1024-byte blocks.
+            let tc = TensorCache::new(cfg(1 << 20, Some(dir.clone()))).unwrap();
+            oid = tc.register("ns", "p", 1, compat, &payload(4096)).unwrap();
+            tc.persist(&oid).unwrap();
+        }
+        // The same store opened by a runtime configured with another block size.
+        let mut config = cfg(1 << 20, Some(dir.clone()));
+        config.block_size = 4096;
+        let tc = TensorCache::new(config).unwrap();
+        assert_eq!(tc.restore(&oid, &Tier::Host).unwrap(), payload(4096));
+        // The host copy made by the restore is readable and agrees with disk.
+        assert_eq!(tc.restore(&oid, &Tier::Host).unwrap(), payload(4096));
+        tc.verify(&oid).unwrap();
+        tc.delete(&oid).unwrap();
+        assert_eq!(tc.resources().host_used, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_persist_leaves_no_reservation_or_block_reference() {
+        let dir = temp_dir();
+        let mut config = cfg(1 << 20, Some(dir.clone()));
+        config.persistent_capacity = 2048;
+        let tc = TensorCache::new(config).unwrap();
+        // A block file with the right name but the wrong bytes is on disk.
+        let damaged = block(9);
+        let name = crate::hash::hash(&damaged).to_hex();
+        std::fs::write(dir.join("blocks").join(name), b"damaged").unwrap();
+        let first = tc
+            .register("ns", "damaged", 1, f32_compat(vec![16, 16]), &damaged)
+            .unwrap();
+        assert!(matches!(tc.persist(&first), Err(Error::Persistence(_))));
+        assert_eq!(tc.resources().storage_used, 0);
+        assert!(!tc
+            .metadata(&first)
+            .unwrap()
+            .placements
+            .contains(&Tier::Persistent));
+        // The failed attempt holds nothing back: the whole tier is available.
+        let second = tc
+            .register(
+                "ns",
+                "full",
+                1,
+                f32_compat(vec![16, 32]),
+                &[block(40), block(41)].concat(),
+            )
+            .unwrap();
+        tc.persist(&second).unwrap();
+        assert_eq!(tc.resources().storage_used, 2048);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Default)]
+    struct Faults {
+        fail_h2d: std::sync::atomic::AtomicBool,
+        corrupt_d2h: std::sync::atomic::AtomicBool,
+    }
+
+    /// A device backend whose copies can be made to fail or to return damaged
+    /// bytes. Allocation is delegated to a CPU backend the test can inspect.
+    struct FaultyBackend {
+        id: BackendId,
+        inner: Arc<crate::backend_cpu::CpuBackend>,
+        faults: Arc<Faults>,
+    }
+
+    impl Backend for FaultyBackend {
+        fn id(&self) -> &BackendId {
+            &self.id
+        }
+        fn byte_capacity(&self) -> u64 {
+            self.inner.byte_capacity()
+        }
+        fn bytes_allocated(&self) -> u64 {
+            self.inner.bytes_allocated()
+        }
+        fn allocate(&self, bytes: usize) -> Result<DeviceBuffer> {
+            let mut dev = self.inner.allocate(bytes)?;
+            dev.backend = self.id.clone();
+            Ok(dev)
+        }
+        fn to_device(&self, host: &[u8], dev: &mut DeviceBuffer) -> Result<()> {
+            if self
+                .faults
+                .fail_h2d
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Backend("injected H2D failure".into()));
+            }
+            self.inner.to_device(host, dev)
+        }
+        fn device_to_host(&self, dev: &DeviceBuffer, host: &mut [u8]) -> Result<()> {
+            self.inner.device_to_host(dev, host)?;
+            if self
+                .faults
+                .corrupt_d2h
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                host[0] ^= 0xff;
+            }
+            Ok(())
+        }
+        fn copy_in(&self, dev: &mut DeviceBuffer, offset: usize, data: &[u8]) -> Result<()> {
+            self.inner.copy_in(dev, offset, data)
+        }
+        fn copy_out(&self, dev: &DeviceBuffer, offset: usize, data: &mut [u8]) -> Result<()> {
+            self.inner.copy_out(dev, offset, data)
+        }
+        fn fill(&self, dev: &mut DeviceBuffer, bytes: usize, value: u8) -> Result<()> {
+            self.inner.fill(dev, bytes, value)
+        }
+        fn free(&self, dev: DeviceBuffer) -> Result<()> {
+            self.inner.free(dev)
+        }
+    }
+
+    fn with_faulty_device(
+        persistent: Option<PathBuf>,
+    ) -> (
+        TensorCache,
+        Tier,
+        Arc<crate::backend_cpu::CpuBackend>,
+        Arc<Faults>,
+    ) {
+        let id = BackendId::new("faulty", 0);
+        let device = Arc::new(crate::backend_cpu::CpuBackend::new(7, 1 << 20));
+        let faults = Arc::new(Faults::default());
+        let backend = FaultyBackend {
+            id: id.clone(),
+            inner: Arc::clone(&device),
+            faults: Arc::clone(&faults),
+        };
+        let tc =
+            TensorCache::with_backends(cfg(1 << 20, persistent), vec![Box::new(backend)]).unwrap();
+        (tc, Tier::Accelerator(id), device, faults)
+    }
+
+    #[test]
+    fn failed_device_copy_returns_the_allocation() {
+        use std::sync::atomic::Ordering;
+        let (tc, accel, device, faults) = with_faulty_device(None);
+        let oid = tc
+            .register("ns", "dev", 1, f32_compat(vec![16, 16]), &block(5))
+            .unwrap();
+        faults.fail_h2d.store(true, Ordering::SeqCst);
+        assert!(matches!(tc.promote(&oid, &accel), Err(Error::Backend(_))));
+        assert_eq!(
+            device.bytes_allocated(),
+            0,
+            "the failed promotion kept its device buffer"
+        );
+        assert_eq!(tc.resources().accel_used, 0);
+        faults.fail_h2d.store(false, Ordering::SeqCst);
+        tc.promote(&oid, &accel).unwrap();
+        assert_eq!(device.bytes_allocated(), 1024);
+        tc.delete(&oid).unwrap();
+        assert_eq!(device.bytes_allocated(), 0);
+    }
+
+    #[test]
+    fn damaged_device_bytes_are_not_served() {
+        use std::sync::atomic::Ordering;
+        let dir = temp_dir();
+        let (tc, accel, _device, faults) = with_faulty_device(Some(dir.clone()));
+        let data = block(6);
+        let oid = tc
+            .register("ns", "dev", 1, f32_compat(vec![16, 16]), &data)
+            .unwrap();
+        tc.promote(&oid, &accel).unwrap();
+        // Move the host copy to disk: the device copy is now the one read.
+        tc.demote(&oid, &Tier::Host).unwrap();
+        faults.corrupt_d2h.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            tc.restore(&oid, &Tier::Host),
+            Err(Error::Integrity(_))
+        ));
+        assert!(!tc.metadata(&oid).unwrap().placements.contains(&Tier::Host));
+        faults.corrupt_d2h.store(false, Ordering::SeqCst);
+        assert_eq!(tc.restore(&oid, &Tier::Host).unwrap(), data);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

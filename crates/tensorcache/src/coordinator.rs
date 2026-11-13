@@ -78,8 +78,10 @@ impl Coordinator {
             w.u64(st.fence);
         }
         let bytes = w.into_inner();
-        std::fs::write(path, bytes)?;
-        Ok(())
+        // Replace the snapshot atomically: a crash while it is being written
+        // must leave the previous one, not a truncated file that loses every
+        // ownership record.
+        crate::persistence::atomic_write(path, &bytes)
     }
 
     /// Load a snapshot, if present, and advance the epoch/rotate boot identity
@@ -233,7 +235,7 @@ impl Coordinator {
                             state.fence
                         )));
                     }
-                    let expires = now_ns() + self.lease_ns;
+                    let expires = now_ns().saturating_add(self.lease_ns);
                     Ok(vec![Message::LeaseGrant {
                         object_id: object_id.clone(),
                         epoch: self.epoch.value(),
@@ -366,6 +368,68 @@ mod tests {
             matches!(&lk[0], Message::LookupResult { found: true, owner: Some(o), owner_addr: Some(a), .. } if o == "n1" && a == "127.0.0.1:1")
         );
         let _ = oid;
+    }
+
+    #[test]
+    fn unbounded_lease_duration_saturates() {
+        let mut c = Coordinator::new(u64::MAX);
+        c.handle(&Message::Create {
+            namespace: "ns".into(),
+            key: "k".into(),
+            generation: 1,
+            byte_len: 8,
+            compat: vec![],
+            node_id: "a".into(),
+        })
+        .unwrap();
+        let oid = Address::new("ns", "k", 1).object_id().to_hex();
+        let grant = c
+            .handle(&Message::LeaseRenew {
+                object_id: oid,
+                fence: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            &grant[0],
+            Message::LeaseGrant { expires_ns, .. } if *expires_ns == u64::MAX
+        ));
+    }
+
+    #[test]
+    fn snapshot_is_replaced_in_place_and_survives_restart() {
+        let dir = std::env::temp_dir().join(format!("tc-coord-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let snap = dir.join("coord.snap");
+        let mut c = Coordinator::new(10_000_000);
+        for key in ["a", "b", "c"] {
+            c.handle(&Message::Create {
+                namespace: "ns".into(),
+                key: key.into(),
+                generation: 1,
+                byte_len: 8,
+                compat: vec![],
+                node_id: "n1".into(),
+            })
+            .unwrap();
+            // Every save replaces the previous snapshot.
+            c.save_state(&snap).unwrap();
+        }
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["coord.snap".to_string()],
+            "no temp file is left"
+        );
+        let mut restarted = Coordinator::new(10_000_000);
+        restarted.load_state(&snap).unwrap();
+        assert_eq!(restarted.object_count(), 3);
+        assert!(restarted.epoch() > c.epoch());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
